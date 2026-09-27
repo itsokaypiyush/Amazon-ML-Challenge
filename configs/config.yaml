@@ -1,0 +1,101 @@
+# =============================================================================
+# Entity Resolution Pipeline Configuration
+# =============================================================================
+
+paths:
+  data_dir: "data"
+  source1: "data/source1.tsv"
+  source2: "data/source2.tsv"
+  source3: "data/source3.tsv"
+  train_ground_truth: "data/train_ground_truth.tsv"
+  test_source1: "data/test_source1.tsv"
+  test_source2: "data/test_source2.tsv"
+  test_source3: "data/test_source3.tsv"
+
+  candidate_pairs_train: "outputs/candidate_pairs_train.tsv"
+  candidate_pairs_test: "outputs/candidate_pairs_test.tsv"
+  features_train: "outputs/features_train.parquet"
+  features_test: "outputs/features_test.parquet"
+
+  gbm_model_out: "models/gbm_model.txt"
+  cross_encoder_model_out: "models/cross_encoder"
+  threshold_out: "models/decision_threshold.json"
+
+  final_predictions: "outputs/matching_results.tsv"
+
+columns:
+  id_col: "id"
+  name_col: "company_name"
+  address_col: "address"
+  city_col: "city"
+  zip_col: "zip"
+
+blocking:
+  top_k: 20                      # candidates per source1 record, per target source
+  ngram_range: [2, 3]            # char n-gram range for TF-IDF blocking
+  tfidf_max_features: 50000
+  use_embeddings: true            # set false to run TF-IDF + exact blocking only (no sentence-transformers/faiss needed)
+  use_phonetic_block: true
+  use_zip_prefix_block: true      # enables blocking strategy 2: raw-first-token + zip-prefix exact key
+  zip_prefix_len: 3
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_batch_size: 256
+  faiss_nlist: 100               # IVF clusters; falls back to flat index if candidate pool is small
+  min_blocking_recall_target: 0.98   # sanity-check threshold during dev
+
+features:
+  string_metrics:
+    - jaro_winkler
+    - levenshtein_ratio
+    - token_sort_ratio
+    - token_set_ratio
+    - monge_elkan
+    - char_ngram_jaccard
+  fields_to_compare: ["name", "address"]
+  add_length_diff: true
+  add_numeric_token_overlap: true   # street numbers, zip digits
+  add_acronym_match: true
+  add_geo_block_match_flag: true
+
+gbm:
+  objective: "binary"
+  metric: "average_precision"
+  num_leaves: 63
+  learning_rate: 0.03
+  n_estimators: 2000
+  early_stopping_rounds: 100
+  scale_pos_weight_cap: 20        # cap for extreme class imbalance
+  random_state: 42
+  negative_sampling_ratio: 10     # negatives : positives during training
+
+cross_encoder:
+  enabled: true                   # set false to run GBM-only (faster, still strong for tabular ER)
+  base_model: "microsoft/deberta-v3-small"
+  max_length: 96
+  batch_size: 32
+  learning_rate: 2e-5
+  epochs: 3
+  warmup_ratio: 0.1
+  negative_sampling_ratio: 5
+
+ensemble:
+  method: "weighted_average"      # "weighted_average" | "gbm_only" | "cross_encoder_only" | "stacked"
+  gbm_weight: 0.5
+  cross_encoder_weight: 0.5
+
+evaluation:
+  beta: 0.5                       # F-beta, beta=0.5 => precision weighted 4x recall in the harmonic mean
+  threshold_search_space: [0.50, 0.99]   # full range searched for diagnostics/curve plotting
+  threshold_search_steps: 200
+  min_decision_threshold: 0.85    # HARD FLOOR: the selected threshold is never allowed below this,
+                                   # even if a lower value scores higher macro F0.5 on validation.
+                                   # F0.5 weights precision 4x recall in the harmonic mean, and false
+                                   # merges are heavily penalized per the challenge spec, so a low-
+                                   # confidence "best on validation" threshold is exactly the kind of
+                                   # overfit-to-a-small-val-set result we want to refuse by construction.
+  cv_folds: 5
+  group_by: "source1_id"          # threshold tuned to maximize macro F0.5 over source1 entities
+
+inference:
+  max_matches_per_source1: 5      # safety cap; rare for a source1 id to legitimately match >5 records
+  require_min_margin: 0.0         # optional margin between top and 2nd candidate before accepting 2nd+ match

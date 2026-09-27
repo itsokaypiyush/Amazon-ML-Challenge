@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+data/
+outputs/
+models/*.pkl
+models/*.bin
+models/*.pt
+.vscode/
+.DS_Store
