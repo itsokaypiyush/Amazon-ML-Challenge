@@ -22,6 +22,8 @@ datasets or tight compute budgets, GBM-only is a fully functional pipeline.
 
 from __future__ import annotations
 
+import inspect
+
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -167,13 +169,20 @@ class CrossEncoderMatcher:
         val_ds = PairDataset(val_a, val_b, val_df["label"].tolist(),
                               self.tokenizer, self.max_length)
 
+        # transformers>=5 folded `warmup_ratio` into `warmup_steps` (a float
+        # in [0, 1) is read as a ratio); older versions only take `warmup_ratio`.
+        if "warmup_ratio" in inspect.signature(TrainingArguments).parameters:
+            warmup_kwargs = {"warmup_ratio": self.warmup_ratio}
+        else:
+            warmup_kwargs = {"warmup_steps": self.warmup_ratio}
+
         args = TrainingArguments(
             output_dir=self.output_dir,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size * 2,
             learning_rate=self.learning_rate,
             num_train_epochs=self.epochs,
-            warmup_ratio=self.warmup_ratio,
+            **warmup_kwargs,
             eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
@@ -182,6 +191,7 @@ class CrossEncoderMatcher:
             logging_steps=50,
             save_total_limit=2,
             report_to=[],
+            fp16=torch.cuda.is_available(),  # tensor cores on CUDA GPUs (e.g. Kaggle T4); MPS/CPU stay fp32
             seed=self.random_state,
         )
 
@@ -209,7 +219,12 @@ class CrossEncoderMatcher:
         texts_a, texts_b = self._build_texts(df, s1_lookup, t_lookups)
         ds = PairDataset(texts_a, texts_b, None, self.tokenizer, self.max_length)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():  # Apple Silicon GPU
+            device = "mps"
+        else:
+            device = "cpu"
         self.model.to(device)
 
         probs = []

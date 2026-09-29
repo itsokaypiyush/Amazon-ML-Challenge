@@ -3,14 +3,15 @@
 # =============================================================================
 
 paths:
-  data_dir: "data"
-  source1: "data/source1.tsv"
-  source2: "data/source2.tsv"
-  source3: "data/source3.tsv"
-  train_ground_truth: "data/train_ground_truth.tsv"
-  test_source1: "data/test_source1.tsv"
-  test_source2: "data/test_source2.tsv"
-  test_source3: "data/test_source3.tsv"
+  # Challenge data, extracted from 6ab10eb3b23ba_student_resource.zip
+  data_dir: "data/student_resource/dataset"
+  source1: "data/student_resource/dataset/train/train_source1.tsv"
+  source2: "data/student_resource/dataset/train/train_source2.tsv"
+  source3: "data/student_resource/dataset/train/train_source3.tsv"
+  train_ground_truth: "data/student_resource/dataset/train/train_ground_truth.tsv"
+  test_source1: "data/student_resource/dataset/test/test_source1.tsv"
+  test_source2: "data/student_resource/dataset/test/test_source2.tsv"
+  test_source3: "data/student_resource/dataset/test/test_source3.tsv"
 
   candidate_pairs_train: "outputs/candidate_pairs_train.tsv"
   candidate_pairs_test: "outputs/candidate_pairs_test.tsv"
@@ -21,7 +22,9 @@ paths:
   cross_encoder_model_out: "models/cross_encoder"
   threshold_out: "models/decision_threshold.json"
 
-  final_predictions: "outputs/matching_results.tsv"
+  # Submission files (challenge format: output/matching_results.tsv + output/candidate_pairs.tsv)
+  final_predictions: "output/matching_results.tsv"
+  submission_candidate_pairs: "output/candidate_pairs.tsv"
 
 columns:
   id_col: "id"
@@ -31,16 +34,23 @@ columns:
   zip_col: "zip"
 
 blocking:
-  top_k: 20                      # candidates per source1 record, per target source
+  top_k: 20                      # TF-IDF candidates per source1 record, per target source
   ngram_range: [2, 3]            # char n-gram range for TF-IDF blocking
   tfidf_max_features: 50000
-  use_embeddings: true            # set false to run TF-IDF + exact blocking only (no sentence-transformers/faiss needed)
+  svd_dim: 256                   # TF-IDF vectors are compressed to this many dims for the FAISS search
+  fit_sample_size: 300000        # texts used to fit the TF-IDF vocabulary + SVD
+  ann_nprobe: 256                # FAISS IVF clusters searched per query (higher = better recall, slower)
+  rerank_factor: 5               # retrieve top_k * this from FAISS, re-rank by exact TF-IDF cosine
+  use_embeddings: false           # sentence-embedding strategy: +0.07% recall on train for ~2 h extra compute
   use_phonetic_block: true
-  use_zip_prefix_block: true      # enables blocking strategy 2: raw-first-token + zip-prefix exact key
+  use_zip_prefix_block: true      # enables blocking strategy 2: raw-first-token + geo exact key
+  use_address_block: true         # street number + street name exact key
   zip_prefix_len: 3
+  max_block_size: 50             # exact-key blocks with more target records than this are skipped
+                                 # (the data has no zip/city, so keys fall back to country and
+                                 # common name tokens would otherwise explode into huge joins)
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
   embedding_batch_size: 256
-  faiss_nlist: 100               # IVF clusters; falls back to flat index if candidate pool is small
   min_blocking_recall_target: 0.98   # sanity-check threshold during dev
 
 features:
@@ -69,11 +79,11 @@ gbm:
   negative_sampling_ratio: 10     # negatives : positives during training
 
 cross_encoder:
-  enabled: true                   # set false to run GBM-only (faster, still strong for tabular ER)
+  enabled: false                  # DeBERTa-v3 diverged (NaN loss) on Apple MPS; GBM-only until fixed
   base_model: "microsoft/deberta-v3-small"
   max_length: 96
   batch_size: 32
-  learning_rate: 2e-5
+  learning_rate: 2.0e-5
   epochs: 3
   warmup_ratio: 0.1
   negative_sampling_ratio: 5
@@ -97,5 +107,6 @@ evaluation:
   group_by: "source1_id"          # threshold tuned to maximize macro F0.5 over source1 entities
 
 inference:
-  max_matches_per_source1: 5      # safety cap; rare for a source1 id to legitimately match >5 records
+  max_matches_per_source1: 10     # safety cap; training ground truth has up to 10 matches per source1 id
+  predict_chunk_size: 100000      # source1 records featurized + scored at a time (bounds memory)
   require_min_margin: 0.0         # optional margin between top and 2nd candidate before accepting 2nd+ match

@@ -16,7 +16,9 @@ we implement it directly on top of rapidfuzz's token-level primitives.
 
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -187,64 +189,74 @@ def compute_pair_features(
     return feats
 
 
+def _features_chunk(args: tuple) -> pd.DataFrame:
+    """Worker: features for one chunk of pairs (six aligned string lists)."""
+    rows = [compute_pair_features(*v) for v in zip(*args)]
+    return pd.DataFrame.from_records(rows).astype(np.float32)
+
+
+_POOL: Optional[ProcessPoolExecutor] = None
+
+
+def _pool(n_jobs: int) -> ProcessPoolExecutor:
+    global _POOL
+    if _POOL is None:
+        _POOL = ProcessPoolExecutor(max_workers=n_jobs)
+    return _POOL
+
+
 def build_pair_features(
     candidate_pairs: pd.DataFrame,
     source1: pd.DataFrame,
     source2: pd.DataFrame,
     source3: pd.DataFrame,
     id_col: str = "id",
+    n_jobs: Optional[int] = None,
+    chunk_size: int = 50_000,
 ) -> pd.DataFrame:
     """
     Join candidate pairs against the cleaned Source 1 / Source 2 / Source 3
-    tables and compute the full feature matrix.
+    tables and compute the full feature matrix, in parallel over `n_jobs`
+    processes (default: all CPU cores).
 
     `candidate_pairs` must have: source1_id, target_id, target_source, plus
-    the blocking strategy indicator/score columns from Module 2 (those are
-    carried through as features directly, since strategy agreement itself
-    is predictive of a true match).
+    the blocking columns from Module 2 (strategy flags, tfidf_score/rank/gap,
+    ...), which are carried through as features directly, since strategy
+    agreement itself is predictive of a true match.
 
-    Returns a dataframe with one row per candidate pair: identifying columns
-    (source1_id, target_id, target_source) + all engineered feature columns.
+    Returns a dataframe with one row per candidate pair (same order as
+    `candidate_pairs`): identifying columns (source1_id, target_id,
+    target_source) + all engineered feature columns.
     """
     global FEATURE_COLUMNS
+    cols = ["clean_name", "clean_address", "clean_zip"]
+    s1_lookup = source1.set_index(id_col)[cols]
+    target_lookups = {"source2": source2.set_index(id_col)[cols], "source3": source3.set_index(id_col)[cols]}
 
-    s1_lookup = source1.set_index(id_col)[["clean_name", "clean_address", "clean_zip"]]
-    s2_lookup = source2.set_index(id_col)[["clean_name", "clean_address", "clean_zip"]]
-    s3_lookup = source3.set_index(id_col)[["clean_name", "clean_address", "clean_zip"]]
-    target_lookups = {"source2": s2_lookup, "source3": s3_lookup}
+    n = len(candidate_pairs)
+    s1_rows = s1_lookup.reindex(candidate_pairs["source1_id"].to_numpy())
+    t_vals = {c: np.empty(n, dtype=object) for c in cols}
+    target_source = candidate_pairs["target_source"].to_numpy()
+    for name, lookup in target_lookups.items():
+        mask = target_source == name
+        if mask.any():
+            rows = lookup.reindex(candidate_pairs["target_id"].to_numpy()[mask])
+            for c in cols:
+                t_vals[c][mask] = rows[c].to_numpy()
 
-    records = []
-    blocking_score_cols = [
-        c for c in candidate_pairs.columns
-        if c.startswith("strategy_") or c.endswith("_score") or c == "num_strategies_agree"
-    ]
+    columns = [s1_rows[c].to_numpy() for c in cols] + [t_vals[c] for c in cols]
+    # compute_pair_features takes (s1_name, s1_addr, s1_zip, t_name, t_addr, t_zip)
+    chunks = [tuple(col[s:s + chunk_size].tolist() for col in columns) for s in range(0, n, chunk_size)]
+    n_jobs = n_jobs or os.cpu_count() or 1
+    if n_jobs > 1 and len(chunks) > 1:
+        parts = list(_pool(n_jobs).map(_features_chunk, chunks))
+    else:
+        parts = [_features_chunk(c) for c in chunks]
 
-    for target_source, group in candidate_pairs.groupby("target_source"):
-        t_lookup = target_lookups[target_source]
-        s1_ids = group["source1_id"].values
-        t_ids = group["target_id"].values
-
-        s1_rows = s1_lookup.reindex(s1_ids)
-        t_rows = t_lookup.reindex(t_ids)
-
-        for i in range(len(group)):
-            feats = compute_pair_features(
-                s1_rows["clean_name"].iloc[i], s1_rows["clean_address"].iloc[i], s1_rows["clean_zip"].iloc[i],
-                t_rows["clean_name"].iloc[i], t_rows["clean_address"].iloc[i], t_rows["clean_zip"].iloc[i],
-            )
-            row = {
-                "source1_id": s1_ids[i],
-                "target_id": t_ids[i],
-                "target_source": target_source,
-            }
-            for c in blocking_score_cols:
-                row[c] = group[c].iloc[i]
-            row.update(feats)
-            records.append(row)
-
-    feature_df = pd.DataFrame.from_records(records)
+    feats = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    carried = candidate_pairs.reset_index(drop=True)
+    feature_df = pd.concat([carried, feats], axis=1)
 
     id_cols = {"source1_id", "target_id", "target_source"}
     FEATURE_COLUMNS = [c for c in feature_df.columns if c not in id_cols]
-
     return feature_df

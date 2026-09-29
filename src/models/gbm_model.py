@@ -53,19 +53,14 @@ def build_labels(
     """
     gt = ground_truth.copy()
     gt["matched_ids"] = gt["matched_ids"].fillna("").astype(str)
-    gt_map = {
-        row["source1_id"]: set(
-            x.strip() for x in row["matched_ids"].split(",") if x.strip()
-        )
-        for _, row in gt.iterrows()
+    keys = {
+        f"{sid}|{t.strip()}"
+        for sid, ids in zip(gt["source1_id"], gt["matched_ids"])
+        for t in ids.split(",") if t.strip()
     }
-
-    def _label(row) -> int:
-        true_set = gt_map.get(row["source1_id"], set())
-        return int(str(row["target_id"]) in true_set)
-
     out = feature_df.copy()
-    out["label"] = out.apply(_label, axis=1)
+    pair = out["source1_id"].astype(str) + "|" + out["target_id"].astype(str)
+    out["label"] = pair.isin(keys).astype(np.int8)
     return out
 
 
@@ -125,6 +120,7 @@ class GBMMatcher:
         gkf = GroupKFold(n_splits=min(n_splits, max(2, len(np.unique(groups)) // 2 or 2)))
         best_iterations = []
         fold_metrics = []
+        oof = np.zeros(len(y), dtype=np.float64)
 
         for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
             train_set = lgb.Dataset(X[train_idx], label=y[train_idx])
@@ -142,6 +138,7 @@ class GBMMatcher:
             )
             best_iterations.append(booster.best_iteration)
             val_pred = booster.predict(X[val_idx], num_iteration=booster.best_iteration)
+            oof[val_idx] = val_pred
             fold_metrics.append(
                 {"fold": fold, "best_iteration": booster.best_iteration,
                  "n_val": len(val_idx), "n_val_pos": int(y[val_idx].sum())}
@@ -153,7 +150,10 @@ class GBMMatcher:
         full_set = lgb.Dataset(X, label=y)
         self.booster = lgb.train(params, full_set, num_boost_round=final_rounds)
 
-        return {"fold_metrics": fold_metrics, "final_num_rounds": final_rounds}
+        # Out-of-fold predictions: every row scored by a model that never saw
+        # its source1 group -- use these (not the final model's in-sample
+        # scores) to pick the decision threshold.
+        return {"fold_metrics": fold_metrics, "final_num_rounds": final_rounds, "oof_pred": oof}
 
     def predict_proba(self, feature_df: pd.DataFrame) -> np.ndarray:
         if self.booster is None:

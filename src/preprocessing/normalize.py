@@ -67,6 +67,10 @@ LEGAL_SUFFIX_MAP = {
     "kg": "kommanditgesellschaft",
     "and": "and",
     "&": "and",
+    # Transliterated Hindi spellings (see _transliterate_devanagari)
+    "praivet": "private",
+    "kampani": "company",
+    "elaelapi": "limited liability partnership",
 }
 
 # Street / address abbreviations -> canonical expanded form.
@@ -132,6 +136,61 @@ _MULTI_SPACE_RE = re.compile(r"\s+")
 _LEADING_TRAILING_PUNCT_RE = re.compile(r"^\W+|\W+$")
 
 
+# Devanagari -> Latin (phonetic, simplified). Source 1 is Latin-only while
+# Source 2/3 carry Hindi-script transliterations of the same English names
+# ("रेड वेंचर्स प्राइवेट लिमिटेड" = "Red Ventures Private Limited"), so this
+# brings them back into the same alphabet for n-gram / fuzzy matching.
+_DEV_CONSONANTS = {
+    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "n", "च": "ch", "छ": "chh", "ज": "j",
+    "झ": "jh", "ञ": "n", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh", "ण": "n", "त": "t",
+    "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p", "फ": "f", "ब": "b", "भ": "bh",
+    "म": "m", "य": "y", "र": "r", "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s",
+    "ह": "h", "ळ": "l", "क़": "q", "ख़": "kh", "ग़": "g", "ज़": "z", "ड़": "r", "ढ़": "rh",
+    "फ़": "f", "य़": "y",
+}
+_DEV_VOWELS = {
+    "अ": "a", "आ": "a", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u", "ऋ": "ri", "ए": "e",
+    "ऐ": "ai", "ओ": "o", "औ": "au", "ऑ": "o", "ऍ": "e", "ॐ": "om",
+}
+_DEV_MATRAS = {
+    "ा": "a", "ि": "i", "ी": "i", "ु": "u", "ू": "u", "ृ": "ri", "े": "e", "ै": "ai",
+    "ो": "o", "ौ": "au", "ॉ": "o", "ॅ": "e",
+}
+_DEV_OTHER = {"ं": "n", "ँ": "n", "ः": "h", "।": " ", "॥": " ",
+              **{chr(0x0966 + i): str(i) for i in range(10)}}
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
+def _transliterate_devanagari(text: str) -> str:
+    out: list[str] = []
+    pending_a = False  # inherent vowel of the previous consonant
+    for ch in text:
+        if ch in _DEV_MATRAS:
+            out.append(_DEV_MATRAS[ch])
+            pending_a = False
+            continue
+        if ch == "\u094d":  # virama: consonant without inherent vowel
+            pending_a = False
+            continue
+        if ch == "\u093c":  # nukta: ignore
+            continue
+        if pending_a:
+            # Schwa deletion: drop the inherent "a" at the end of a word.
+            if ch in _DEV_CONSONANTS or ch in _DEV_VOWELS or ch in "ंँः":
+                out.append("a")
+            pending_a = False
+        if ch in _DEV_CONSONANTS:
+            out.append(_DEV_CONSONANTS[ch])
+            pending_a = True
+        elif ch in _DEV_VOWELS:
+            out.append(_DEV_VOWELS[ch])
+        elif ch in _DEV_OTHER:
+            out.append(_DEV_OTHER[ch])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _strip_accents(text: str) -> str:
     """Normalize unicode (e.g. 'Café' -> 'Cafe') so accented vendor data
     matches cleanly against ASCII reference data."""
@@ -156,6 +215,8 @@ def _base_clean(text: Optional[str]) -> str:
     if not text:
         return ""
 
+    if _DEVANAGARI_RE.search(text):
+        text = _transliterate_devanagari(text)
     text = _strip_accents(text)
     text = text.lower()
 
@@ -253,28 +314,43 @@ def phonetic_code(name: str) -> str:
     return first_token[:4]
 
 
+def geo_key(
+    city: Optional[str] = None,
+    zip_code: Optional[str] = None,
+    country: Optional[str] = None,
+    zip_prefix_len: int = 3,
+) -> str:
+    """Coarsest available geo signal: zip prefix, else city, else country.
+    The challenge data only carries `country`, so that is the usual fallback."""
+    if zip_code:
+        z = normalize_zip(zip_code)
+        if z:
+            return z[:zip_prefix_len]
+    if city:
+        c = _base_clean(city)[:5]
+        if c:
+            return c
+    return _base_clean(country)
+
+
 def build_blocking_key(
     name: str,
     city: Optional[str] = None,
     zip_code: Optional[str] = None,
     zip_prefix_len: int = 3,
+    country: Optional[str] = None,
 ) -> str:
     """
     Build a coarse exact-match blocking key from normalized fields.
 
     Combines the phonetic code of the company name with a geo key (zip
-    prefix, falling back to city) so that records for genuinely different
-    businesses in different regions never collide, while allowing modest
-    spelling variation within the same name/region bucket.
+    prefix, falling back to city, then country) so that records for
+    genuinely different businesses in different regions never collide,
+    while allowing modest spelling variation within the same name/region
+    bucket.
     """
     phon = phonetic_code(name)
-    geo = ""
-    if zip_code:
-        z = normalize_zip(zip_code)
-        geo = z[:zip_prefix_len] if z else ""
-    if not geo and city:
-        geo = _base_clean(city)[:5]
-    return f"{phon}|{geo}"
+    return f"{phon}|{geo_key(city, zip_code, country, zip_prefix_len)}"
 
 
 def preprocess_dataframe(
@@ -284,11 +360,12 @@ def preprocess_dataframe(
     city_col: str = "city",
     zip_col: str = "zip",
     zip_prefix_len: int = 3,
+    country_col: str = "country",
 ) -> pd.DataFrame:
     """
     Apply full normalization to a raw dataframe and return an augmented copy
     with new columns: `clean_name`, `clean_address`, `clean_zip`,
-    `phonetic_code`, `blocking_key`.
+    `phonetic_code`, `geo_key`, `country_key`, `blocking_key`.
 
     Missing optional columns (city/zip) degrade gracefully — the blocking
     key just relies on whichever geo signal is available.
@@ -328,10 +405,13 @@ def preprocess_dataframe(
         out["clean_zip"] = ""
 
     city_series = out[city_col] if city_col in out.columns else pd.Series([""] * len(out))
+    country_series = out[country_col] if country_col in out.columns else pd.Series([""] * len(out))
 
+    out["country_key"] = [_base_clean(c) for c in country_series.to_numpy()]
     out["phonetic_code"] = out["clean_name"].apply(phonetic_code)
-    out["blocking_key"] = [
-        build_blocking_key(n, c, z, zip_prefix_len)
-        for n, c, z in zip(out["clean_name"], city_series, out["clean_zip"])
+    out["geo_key"] = [
+        geo_key(c, z, k, zip_prefix_len)
+        for c, z, k in zip(city_series, out["clean_zip"], country_series)
     ]
+    out["blocking_key"] = out["phonetic_code"] + "|" + out["geo_key"]
     return out

@@ -45,6 +45,17 @@ def _rename_common_columns(df: pd.DataFrame, *, id_col: str = "id") -> pd.DataFr
     return df
 
 
+PIPELINE_COLUMNS = [
+    "id", "clean_name", "clean_address", "clean_zip",
+    "geo_key", "country_key", "phonetic_code", "blocking_key",
+]
+
+
+def keep_pipeline_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop raw columns after preprocessing; blocking/features only use these."""
+    return df[[c for c in PIPELINE_COLUMNS if c in df.columns]]
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -74,6 +85,44 @@ def load_ground_truth_wide(path: str) -> pd.DataFrame:
         raise ValueError(f"Ground truth file {path} missing 'matched_ids' column. Found: {list(df.columns)}")
     df["matched_ids"] = df["matched_ids"].fillna("")
     return df
+
+
+def sample_sources(
+    source1: pd.DataFrame,
+    source2: pd.DataFrame,
+    source3: pd.DataFrame,
+    n_source1: int,
+    gt_wide: "pd.DataFrame | None" = None,
+    seed: int = 42,
+    sample_targets: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Keep `n_source1` random source1 records. Source2/3 are kept in full by
+    default, so candidates (and hard negatives) look like they will at test
+    time. With `sample_targets=True`, the targets are cut to the same
+    fraction as well (much faster, for smoke tests); when ground truth is
+    given, the true matches of the kept source1 records are always kept, so
+    blocking recall stays measurable.
+    """
+    if n_source1 >= len(source1):
+        return source1, source2, source3
+    s1 = source1.sample(n=n_source1, random_state=seed)
+    if not sample_targets:
+        return s1.reset_index(drop=True), source2, source3
+    frac = n_source1 / len(source1)
+
+    must_keep: set = set()
+    if gt_wide is not None:
+        kept_gt = gt_wide[gt_wide["source1_id"].isin(set(s1["id"]))]
+        for ids in kept_gt["matched_ids"]:
+            must_keep.update(x.strip() for x in ids.split(",") if x.strip())
+
+    def _sample_target(t: pd.DataFrame) -> pd.DataFrame:
+        in_gt = t["id"].isin(must_keep)
+        rest = t[~in_gt].sample(frac=frac, random_state=seed)
+        return pd.concat([t[in_gt], rest], ignore_index=True)
+
+    return s1.reset_index(drop=True), _sample_target(source2), _sample_target(source3)
 
 
 def ground_truth_wide_to_long(

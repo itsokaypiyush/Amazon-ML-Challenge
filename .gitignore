@@ -9,3 +9,5 @@ models/*.bin
 models/*.pt
 .vscode/
 .DS_Store
+*.zip
+output/

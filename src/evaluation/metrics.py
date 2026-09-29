@@ -172,19 +172,45 @@ def optimize_threshold(
     best_unrestricted = {"threshold": search_space[0], "f_beta": -1.0}
     best = {"threshold": max(search_space[0], min_decision_threshold), "f_beta": -1.0}
 
-    # Precompute ground truth for every source1 id, including ones with an
-    # empty true set, so the metric penalizes any false positives created
-    # for entities that should be singletons.
-    gt_full = {sid: ground_truth.get(sid, set()) for sid in all_source1_ids}
+    # Vectorized equivalent of predictions_to_matches + macro_f_beta over ALL
+    # source1 ids (ids with an empty true set count too, so false positives on
+    # singletons are penalized). Pairs are sorted by score within each
+    # source1 id, so the pairs above any threshold are a prefix of the group
+    # and the max_matches cap is just "rank < cap".
+    ids = pd.Index(all_source1_ids)
+    n_ids = len(ids)
+    n_true = np.array([len(ground_truth.get(sid, ())) for sid in all_source1_ids], dtype=np.float64)
+    gt_keys = {f"{sid}|{t}" for sid, ts in ground_truth.items() for t in ts}
+
+    pairs = scored_pairs[scored_pairs[score_col] > search_space[0]]
+    q = ids.get_indexer(pairs["source1_id"])
+    ok = q >= 0
+    pairs, q = pairs[ok], q[ok]
+    score = pairs[score_col].to_numpy(np.float64)
+    label = (pairs["source1_id"].astype(str) + "|" + pairs["target_id"].astype(str)).isin(gt_keys).to_numpy()
+    order = np.lexsort((-score, q))
+    q, score, label = q[order], score[order], label[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(q)) + 1] if len(q) else np.array([], dtype=int)
+    rank = np.arange(len(q)) - np.repeat(starts, np.diff(np.r_[starts, len(q)]))
+    beta2 = beta ** 2
 
     for t in thresholds:
-        matches = predictions_to_matches(
-            scored_pairs, threshold=t, score_col=score_col,
-            max_matches_per_source1=max_matches_per_source1,
-        )
-        pred_full = {sid: matches.get(sid, set()) for sid in all_source1_ids}
-        metrics = macro_f_beta(pred_full, gt_full, beta=beta)
-        metrics["threshold"] = float(t)
+        kept = (score > t) & (rank < max_matches_per_source1)
+        n_pred = np.bincount(q[kept], minlength=n_ids).astype(np.float64)
+        tp = np.bincount(q[kept], weights=label[kept], minlength=n_ids)
+        precision = np.divide(tp, n_pred, out=np.zeros(n_ids), where=n_pred > 0)
+        recall = np.divide(tp, n_true, out=np.zeros(n_ids), where=n_true > 0)
+        denom = beta2 * precision + recall
+        f = np.divide((1 + beta2) * precision * recall, denom, out=np.zeros(n_ids), where=denom > 0)
+        empty = (n_pred == 0) & (n_true == 0)  # correctly predicted singleton
+        precision[empty] = recall[empty] = f[empty] = 1.0
+        metrics = {
+            "precision": float(precision.mean()) if n_ids else 0.0,
+            "recall": float(recall.mean()) if n_ids else 0.0,
+            "f_beta": float(f.mean()) if n_ids else 0.0,
+            "n_entities": n_ids,
+            "threshold": float(t),
+        }
         curve.append(metrics)
 
         if metrics["f_beta"] > best_unrestricted["f_beta"]:
@@ -244,11 +270,30 @@ def matches_to_submission_df(
     """
     Build the final `matching_results.tsv`-ready dataframe. Every source1_id
     in `all_source1_ids` gets exactly one row; ids with no surviving matches
-    get an empty string (never omitted, never NaN) in `matched_ids`, per the
-    competition's required singleton-handling format.
+    get an empty string (never omitted, never NaN) in `matched_entity_ids`,
+    per the competition's required singleton-handling format.
     """
     rows = []
     for sid in all_source1_ids:
         matched = sorted(matches.get(sid, set()))
-        rows.append({"source1_id": sid, "matched_ids": ",".join(matched)})
-    return pd.DataFrame(rows, columns=["source1_id", "matched_ids"])
+        rows.append({"source1_entity_id": sid, "matched_entity_ids": ",".join(matched)})
+    return pd.DataFrame(rows, columns=["source1_entity_id", "matched_entity_ids"])
+
+
+def candidates_to_submission_df(
+    candidate_pairs: pd.DataFrame, all_source1_ids: list[str]
+) -> pd.DataFrame:
+    """
+    Build the challenge's `candidate_pairs.tsv`: one row per source1 id with
+    the comma-separated candidate ids that were fed to the matching model
+    (empty string when blocking found none).
+    """
+    grouped = (
+        candidate_pairs.drop_duplicates(["source1_id", "target_id"])
+        .groupby("source1_id")["target_id"]
+        .agg(lambda ids: ",".join(sorted(map(str, ids))))
+    )
+    return pd.DataFrame({
+        "source1_entity_id": all_source1_ids,
+        "candidate_entity_ids": [grouped.get(sid, "") for sid in all_source1_ids],
+    })

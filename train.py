@@ -40,9 +40,10 @@ from src.models.gbm_model import build_labels
 from src.evaluation import optimize_threshold
 from src.evaluation.metrics import save_threshold
 from src.pipeline_utils import (
+    keep_pipeline_columns,
     load_config, load_source_tsv, load_ground_truth_wide,
     ground_truth_wide_to_long, ground_truth_long_to_dict,
-    ensemble_scores, ensure_dir,
+    ensemble_scores, ensure_dir, sample_sources,
 )
 
 logger = logging.getLogger("train")
@@ -53,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/config.yaml")
     p.add_argument("--skip-cross-encoder", action="store_true",
                     help="Force GBM-only training regardless of config setting.")
+    p.add_argument("--sample", type=int, default=None, metavar="N",
+                    help="Train on N random source1 records, matched against the full source2/source3.")
+    p.add_argument("--sample-targets", action="store_true",
+                    help="With --sample: also shrink source2/source3 to the same fraction (quick smoke test).")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
 
@@ -77,6 +82,12 @@ def main() -> None:
     source2_raw = load_source_tsv(paths["source2"], id_col)
     source3_raw = load_source_tsv(paths["source3"], id_col)
     gt_wide = load_ground_truth_wide(paths["train_ground_truth"])
+    if args.sample:
+        source1_raw, source2_raw, source3_raw = sample_sources(
+            source1_raw, source2_raw, source3_raw, args.sample, gt_wide=gt_wide,
+            sample_targets=args.sample_targets,
+        )
+        gt_wide = gt_wide[gt_wide["source1_id"].isin(set(source1_raw["id"]))]
     logger.info("Loaded: source1=%d, source2=%d, source3=%d, ground_truth=%d",
                 len(source1_raw), len(source2_raw), len(source3_raw), len(gt_wide))
 
@@ -96,6 +107,11 @@ def main() -> None:
         source3_raw, cols["name_col"], cols["address_col"], cols["city_col"], cols["zip_col"],
         cfg["blocking"]["zip_prefix_len"],
     )
+
+    # Keep only what later stages use (the raw text columns of 10M+ target
+    # records are several GB we don't need).
+    source1, source2, source3 = (keep_pipeline_columns(df) for df in (source1, source2, source3))
+    del source1_raw, source2_raw, source3_raw
 
     # ---------------------------------------------------------------
     # 3. Blocking / candidate generation (Module 2)
@@ -153,7 +169,9 @@ def main() -> None:
     logger.info("Saved GBM model -> %s", paths["gbm_model_out"])
     logger.info("Top 10 features by gain:\n%s", gbm.feature_importance().head(10).to_string(index=False))
 
-    labeled_df["gbm_score"] = gbm.predict_proba(labeled_df)
+    # Out-of-fold scores, so the threshold below is tuned on predictions the
+    # model did not train on (in-sample scores are overconfident).
+    labeled_df["gbm_score"] = gbm_train_metrics["oof_pred"]
 
     # ---------------------------------------------------------------
     # 6. Train cross-encoder (Module 3b, optional)
@@ -166,7 +184,7 @@ def main() -> None:
             base_model=ce_cfg["base_model"],
             max_length=ce_cfg["max_length"],
             batch_size=ce_cfg["batch_size"],
-            learning_rate=ce_cfg["learning_rate"],
+            learning_rate=float(ce_cfg["learning_rate"]),
             epochs=ce_cfg["epochs"],
             warmup_ratio=ce_cfg["warmup_ratio"],
             output_dir=paths["cross_encoder_model_out"],
